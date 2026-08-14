@@ -4,6 +4,7 @@ import { renderPage, sampleBackground } from '@/lib/pdf/pdfjs';
 import type { ElementEdit, PageState, RegionEdit, Selection, SpanEdit, Tool } from '@/lib/pdf/types';
 import { spanDirty } from '@/lib/pdf/types';
 import { hitTestElements, segsToPathData, partsOf, type VectorElement } from '@/lib/pdf/elements';
+import { ensurePreviewFont } from '@/lib/pdf/fonts';
 
 interface PageViewProps {
   doc: PdfDoc;
@@ -52,6 +53,35 @@ function previewUrl(elId: string, bytes: ArrayBuffer): string {
   return url;
 }
 
+/** 为带 fontId 的编辑项加载预览字体（FontFace），返回 fontId → CSS font-family */
+function usePreviewFontFamilies(items: (SpanEdit | RegionEdit)[]): Record<string, string> {
+  const [families, setFamilies] = useState<Record<string, string>>({});
+  const idsKey = [...new Set(items.map((i) => i.fontId).filter((x): x is string => !!x))]
+    .sort()
+    .join(',');
+  useEffect(() => {
+    if (!idsKey) return;
+    let cancelled = false;
+    (async () => {
+      const entries: [string, string][] = [];
+      for (const id of idsKey.split(',')) {
+        try {
+          entries.push([id, await ensurePreviewFont(id)]);
+        } catch {
+          // 预览加载失败：回退默认字体渲染，导出时再统一报错
+        }
+      }
+      if (!cancelled && entries.length) {
+        setFamilies((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [idsKey]);
+  return families;
+}
+
 export default function PageView({
   doc,
   page,
@@ -77,6 +107,8 @@ export default function PageView({
 
   const cssW = page.width * zoom;
   const cssH = page.height * zoom;
+  const fontFamilies = usePreviewFontFamilies([...page.spans, ...page.regions]);
+  const familyOf = (fontId?: string) => (fontId ? fontFamilies[fontId] : undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -367,6 +399,7 @@ export default function PageView({
           fontSize: item.fontSize * zoom,
           lineHeight: 1.2,
           fontWeight: item.bold ? 700 : 400,
+          fontFamily: familyOf(item.fontId),
           color: item.color,
         }}
         onChange={(e) => commit(e.currentTarget.value)}
@@ -415,6 +448,7 @@ export default function PageView({
               fontSize: s.fontSize * zoom,
               lineHeight: 1.2,
               fontWeight: s.bold ? 700 : 400,
+              fontFamily: familyOf(s.fontId),
               padding: 0,
               minWidth: '100%',
               minHeight: '100%',
@@ -475,6 +509,7 @@ export default function PageView({
                 fontSize: r.fontSize * zoom,
                 lineHeight: 1.25,
                 fontWeight: r.bold ? 700 : 400,
+                fontFamily: familyOf(r.fontId),
                 whiteSpace: 'pre-wrap',
                 wordBreak: 'break-all',
               }}

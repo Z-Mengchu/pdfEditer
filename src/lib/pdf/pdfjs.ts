@@ -168,6 +168,15 @@ export async function extractSpans(
     const width = Math.max(item.width, fontSize * 0.3);
     const fontName = (item.fontName + ' ' + (style?.fontFamily ?? '')).toLowerCase();
     const bold = /bold|black|heavy|demi/.test(fontName);
+    // 原字体名：优先取字体对象的 BaseFont（剥掉子集前缀 ABCDEF+），退化为 styles.fontFamily
+    let originalFontName: string | undefined;
+    try {
+      const fontObj = page.commonObjs.get(item.fontName) as { name?: string } | null;
+      originalFontName = fontObj?.name ?? style?.fontFamily;
+    } catch {
+      originalFontName = style?.fontFamily;
+    }
+    if (originalFontName) originalFontName = originalFontName.replace(/^[A-Z]{6}\+/, '') || undefined;
     const bgColor = sampleBackground(rendered, x, y, width, height, renderScale);
     const color = sampleTextColor(rendered, x, y, width, height, renderScale, bgColor);
     spans.push({
@@ -189,6 +198,7 @@ export async function extractSpans(
       color,
       bgColor,
       bold,
+      originalFontName,
       deleted: false,
     });
   }

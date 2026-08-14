@@ -23,6 +23,10 @@ export interface SpanEdit {
   /** 擦除原文时使用的背景色（采样自原文周围） */
   bgColor: string;
   bold: boolean;
+  /** 选用的字体（fonts.ts 的 fontId）；undefined = 默认 Helvetica/文泉驿 */
+  fontId?: string;
+  /** 解析 PDF 时识别出的原字体名（仅展示用） */
+  originalFontName?: string;
   /** 已删除 = 导出时仅擦除 */
   deleted: boolean;
 }
@@ -43,6 +47,8 @@ export interface RegionEdit {
   fontSize: number;
   color: string;
   bold: boolean;
+  /** 选用的字体（fonts.ts 的 fontId）；undefined = 默认 Helvetica/文泉驿 */
+  fontId?: string;
   align: 'left' | 'center' | 'right';
   valign: 'top' | 'middle' | 'bottom';
 }
@@ -86,10 +92,11 @@ export function isSpan(item: EditItem): item is SpanEdit {
   return item.kind === 'span';
 }
 
-/** 文字块是否被修改过（需要导出时重绘） */
+/** 文字块是否被修改过（需要导出时重绘）；fontId 变化也视为修改（换字体需擦除重绘） */
 export function spanDirty(s: SpanEdit): boolean {
   return (
     s.deleted ||
+    s.fontId != null ||
     s.text !== s.originalText ||
     s.x !== s.ox ||
     s.y !== s.oy ||

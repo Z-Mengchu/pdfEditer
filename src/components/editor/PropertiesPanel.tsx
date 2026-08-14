@@ -1,10 +1,15 @@
-import { useRef } from 'react';
+import { useMemo, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import {
   AlignCenter,
   AlignLeft,
   AlignRight,
+  Check,
+  ChevronsUpDown,
+  Download,
   Eraser,
   ImagePlus,
+  Loader2,
   MousePointer2,
   PaintBucket,
   RotateCcw,
@@ -17,9 +22,25 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command';
+import { cn } from '@/lib/utils';
 import type { EditItem, ElementEdit, RegionEdit, SpanEdit } from '@/lib/pdf/types';
 import { isSpan, spanDirty } from '@/lib/pdf/types';
 import type { VectorElement } from '@/lib/pdf/elements';
+import {
+  BUILTIN_FONTS,
+  isLocalFontAccessSupported,
+  listLocalFonts,
+  type LocalFontInfo,
+} from '@/lib/pdf/fonts';
 
 interface Props {
   item: EditItem | null;
@@ -36,8 +57,8 @@ function NumberField({
   label,
   value,
   onChange,
-  min = 4,
-  max = 200,
+  min = 0.5,
+  max = 500,
 }: {
   label: string;
   value: number;
@@ -45,20 +66,24 @@ function NumberField({
   min?: number;
   max?: number;
 }) {
+  // 输入过程中用本地草稿，避免每次击键就被 min/max 钳制（否则 3.9 永远输不进去）
+  const [draft, setDraft] = useState<string | null>(null);
   return (
     <div className="flex items-center justify-between gap-2">
       <Label className="text-xs text-muted-foreground shrink-0">{label}</Label>
       <input
         type="number"
         className="w-20 h-8 rounded-md border border-input bg-transparent px-2 text-sm"
-        value={Math.round(value * 10) / 10}
+        value={draft ?? String(Math.round(value * 100) / 100)}
         min={min}
         max={max}
         step={0.5}
         onChange={(e) => {
+          setDraft(e.target.value);
           const v = parseFloat(e.target.value);
           if (!Number.isNaN(v)) onChange(Math.min(max, Math.max(min, v)));
         }}
+        onBlur={() => setDraft(null)}
       />
     </div>
   );
@@ -77,6 +102,116 @@ function ColorField({ label, value, onChange }: { label: string; value: string; 
           className="w-8 h-8 rounded cursor-pointer border border-input bg-transparent"
         />
       </div>
+    </div>
+  );
+}
+
+const DEFAULT_FONT_LABEL = '默认（Helvetica / 文泉驿）';
+
+/** 字体选择器：内置字体即点即用；本机字体需 Chromium 授权（TTC 置灰） */
+function FontSelector({
+  value,
+  originalFontName,
+  onChange,
+}: {
+  value?: string;
+  originalFontName?: string;
+  onChange: (fontId: string | undefined) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [locals, setLocals] = useState<LocalFontInfo[] | null>(null);
+  const [loadingLocals, setLoadingLocals] = useState(false);
+
+  const label = useMemo(() => {
+    if (!value) return DEFAULT_FONT_LABEL;
+    const b = BUILTIN_FONTS.find((f) => f.id === value);
+    if (b) return b.name;
+    const l = locals?.find((f) => f.id === value);
+    return l ? l.fullName : value.replace(/^local:/, '');
+  }, [value, locals]);
+
+  const loadLocals = async () => {
+    setLoadingLocals(true);
+    try {
+      setLocals(await listLocalFonts());
+    } catch (err) {
+      toast.error('本机字体加载失败：' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setLoadingLocals(false);
+    }
+  };
+
+  const pick = (fontId: string | undefined) => {
+    onChange(fontId);
+    setOpen(false);
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <Label className="text-xs text-muted-foreground shrink-0">字体</Label>
+        <Popover open={open} onOpenChange={setOpen}>
+          <PopoverTrigger asChild>
+            <button className="flex items-center justify-between gap-1 w-44 h-8 rounded-md border border-input bg-transparent px-2 text-sm hover:bg-accent/50">
+              <span className="truncate">{label}</span>
+              <ChevronsUpDown className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-60 p-0" align="end">
+            <Command>
+              <CommandInput placeholder="搜索字体…" />
+              <CommandList>
+                <CommandEmpty>无匹配字体</CommandEmpty>
+                <CommandGroup heading="默认">
+                  <CommandItem onSelect={() => pick(undefined)}>
+                    <Check className={cn('w-4 h-4 mr-1', value == null ? 'opacity-100' : 'opacity-0')} />
+                    {DEFAULT_FONT_LABEL}
+                  </CommandItem>
+                </CommandGroup>
+                <CommandGroup heading="内置字体">
+                  {BUILTIN_FONTS.map((f) => (
+                    <CommandItem key={f.id} onSelect={() => pick(f.id)}>
+                      <Check className={cn('w-4 h-4 mr-1', value === f.id ? 'opacity-100' : 'opacity-0')} />
+                      {f.name}
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+                {isLocalFontAccessSupported() && (
+                  <CommandGroup heading="本机字体">
+                    {!locals && (
+                      <CommandItem disabled={loadingLocals} onSelect={loadLocals}>
+                        {loadingLocals ? (
+                          <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+                        ) : (
+                          <Download className="w-4 h-4 mr-1" />
+                        )}
+                        {loadingLocals ? '正在枚举本机字体…' : '加载本机字体…（需授权）'}
+                      </CommandItem>
+                    )}
+                    {locals?.map((f) => (
+                      <CommandItem
+                        key={f.id}
+                        disabled={f.unsupported}
+                        onSelect={() => {
+                          if (!f.unsupported) pick(f.id);
+                        }}
+                      >
+                        <Check className={cn('w-4 h-4 mr-1', value === f.id ? 'opacity-100' : 'opacity-0')} />
+                        <span className="truncate">
+                          {f.fullName}
+                          {f.style && f.style !== 'Regular' ? ` ${f.style}` : ''}
+                          {f.unsupported ? '（TTC 暂不支持）' : ''}
+                        </span>
+                      </CommandItem>
+                    ))}
+                  </CommandGroup>
+                )}
+              </CommandList>
+            </Command>
+          </PopoverContent>
+        </Popover>
+      </div>
+      {originalFontName && <p className="text-[11px] text-muted-foreground text-right">原字体：{originalFontName}</p>}
     </div>
   );
 }
@@ -257,6 +392,7 @@ export default function PropertiesPanel({
                   y: s.oy,
                   width: s.owidth,
                   height: s.oheight,
+                  fontId: undefined,
                   deleted: false,
                 })
               }
@@ -272,6 +408,11 @@ export default function PropertiesPanel({
           className="text-sm"
           placeholder="输入替换文字"
           onChange={(e) => onUpdateSpan(s.id, { text: e.target.value })}
+        />
+        <FontSelector
+          value={s.fontId}
+          originalFontName={s.originalFontName}
+          onChange={(fontId) => onUpdateSpan(s.id, { fontId })}
         />
         <NumberField label="字号 (pt)" value={s.fontSize} onChange={(v) => onUpdateSpan(s.id, { fontSize: v })} />
         <ColorField label="文字颜色" value={s.color} onChange={(v) => onUpdateSpan(s.id, { color: v })} />
@@ -317,6 +458,7 @@ export default function PropertiesPanel({
         placeholder="在区域内写入文字（可留空仅涂抹）"
         onChange={(e) => onUpdateRegion(r.id, { text: e.target.value })}
       />
+      <FontSelector value={r.fontId} onChange={(fontId) => onUpdateRegion(r.id, { fontId })} />
       <NumberField label="字号 (pt)" value={r.fontSize} onChange={(v) => onUpdateRegion(r.id, { fontSize: v })} />
       <ColorField label="文字颜色" value={r.color} onChange={(v) => onUpdateRegion(r.id, { color: v })} />
       <div className="flex items-center justify-between">

@@ -3,6 +3,7 @@ import fontkit from '@pdf-lib/fontkit';
 import type { PageState, RegionEdit, SpanEdit } from './types';
 import { spanDirty } from './types';
 import { segsToPathData, partsOf, type VectorElement } from './elements';
+import { fontCovers, loadFontById } from './fonts';
 
 function hexToRgb(hex: string): RGB {
   const n = parseInt(hex.replace('#', ''), 16);
@@ -21,7 +22,14 @@ interface Fonts {
   cjk: PDFFont | null;
 }
 
-function fontFor(ch: string, bold: boolean, fonts: Fonts): PDFFont {
+/** 用户选用的字体：覆盖的字符用它绘制，未覆盖的回退到默认分流 */
+interface CustomFont {
+  font: PDFFont;
+  covers: (ch: string) => boolean;
+}
+
+function fontFor(ch: string, bold: boolean, fonts: Fonts, custom?: CustomFont): PDFFont {
+  if (custom?.covers(ch)) return custom.font;
   if (needsCjk(ch)) {
     if (!fonts.cjk) throw new Error(`字符 "${ch}" 需要中文字体，但字体未加载`);
     return fonts.cjk;
@@ -29,10 +37,10 @@ function fontFor(ch: string, bold: boolean, fonts: Fonts): PDFFont {
   return bold ? fonts.latinBold : fonts.latin;
 }
 
-function textWidth(text: string, size: number, bold: boolean, fonts: Fonts): number {
+function textWidth(text: string, size: number, bold: boolean, fonts: Fonts, custom?: CustomFont): number {
   let w = 0;
   for (const ch of text) {
-    w += fontFor(ch, bold, fonts).widthOfTextAtSize(ch, size);
+    w += fontFor(ch, bold, fonts, custom).widthOfTextAtSize(ch, size);
   }
   return w;
 }
@@ -47,18 +55,20 @@ function drawMixed(
   color: RGB,
   bold: boolean,
   fonts: Fonts,
+  custom?: CustomFont,
 ): number {
   let cx = x;
   for (const ch of text) {
     if (ch === '\n') continue;
-    const font = fontFor(ch, bold, fonts);
-    const cjk = needsCjk(ch);
+    const usedCustom = !!custom?.covers(ch);
+    const font = fontFor(ch, bold, fonts, custom);
+    // 中文字体和自定义字体无粗体字重，双绘模拟加粗；拉丁回退字符用真粗体
+    const faux = bold && (usedCustom || needsCjk(ch));
     page.drawText(ch, { x: cx, y: baselineY, size, font, color });
-    if (bold && cjk) {
-      // 中文字体无粗体字重，双绘模拟加粗
+    if (faux) {
       page.drawText(ch, { x: cx + size * 0.028, y: baselineY, size, font, color });
     }
-    cx += font.widthOfTextAtSize(ch, size) + (bold && cjk ? size * 0.028 : 0);
+    cx += font.widthOfTextAtSize(ch, size) + (faux ? size * 0.028 : 0);
   }
   return cx - x;
 }
@@ -81,20 +91,20 @@ function tokenize(text: string): string[] {
 }
 
 /** 在 maxWidth 内贪心换行，返回行数组（保留手动换行） */
-function wrapText(text: string, maxWidth: number, size: number, bold: boolean, fonts: Fonts): string[] {
+function wrapText(text: string, maxWidth: number, size: number, bold: boolean, fonts: Fonts, custom?: CustomFont): string[] {
   const lines: string[] = [];
   for (const rawLine of text.split('\n')) {
     const tokens = tokenize(rawLine);
     let line = '';
     for (const tok of tokens) {
       const candidate = line + tok;
-      if (line && textWidth(candidate, size, bold, fonts) > maxWidth && tok !== ' ') {
+      if (line && textWidth(candidate, size, bold, fonts, custom) > maxWidth && tok !== ' ') {
         lines.push(line.trimEnd());
         line = tok === ' ' ? '' : tok;
         // 单 token 超宽则按字符硬拆
-        while (textWidth(line, size, bold, fonts) > maxWidth && line.length > 1) {
+        while (textWidth(line, size, bold, fonts, custom) > maxWidth && line.length > 1) {
           let cut = line.length - 1;
-          while (cut > 1 && textWidth(line.slice(0, cut), size, bold, fonts) > maxWidth) cut--;
+          while (cut > 1 && textWidth(line.slice(0, cut), size, bold, fonts, custom) > maxWidth) cut--;
           lines.push(line.slice(0, cut));
           line = line.slice(cut);
         }
@@ -119,13 +129,13 @@ function erase(page: PDFPage, pageH: number, x: number, y: number, w: number, h:
   });
 }
 
-function drawSpanText(page: PDFPage, pageH: number, s: SpanEdit, fonts: Fonts) {
+function drawSpanText(page: PDFPage, pageH: number, s: SpanEdit, fonts: Fonts, custom?: CustomFont) {
   const color = hexToRgb(s.color);
   const lineHeight = s.fontSize * 1.2;
   s.text.split('\n').forEach((line, i) => {
     if (!line) return;
     const baselineY = pageH - (s.y + s.baseline + i * lineHeight);
-    drawMixed(page, line, s.x, baselineY, s.fontSize, color, s.bold, fonts);
+    drawMixed(page, line, s.x, baselineY, s.fontSize, color, s.bold, fonts, custom);
   });
 }
 
@@ -140,11 +150,11 @@ function drawRegionFill(page: PDFPage, pageH: number, r: RegionEdit) {
   });
 }
 
-function drawRegionText(page: PDFPage, pageH: number, r: RegionEdit, fonts: Fonts) {
+function drawRegionText(page: PDFPage, pageH: number, r: RegionEdit, fonts: Fonts, custom?: CustomFont) {
   if (!r.text.trim()) return;
   const inset = 2;
   const maxW = Math.max(4, r.width - inset * 2);
-  const lines = wrapText(r.text, maxW, r.fontSize, r.bold, fonts);
+  const lines = wrapText(r.text, maxW, r.fontSize, r.bold, fonts, custom);
   const lineHeight = r.fontSize * 1.25;
   const blockH = lines.length * lineHeight;
   let startTop: number;
@@ -154,12 +164,12 @@ function drawRegionText(page: PDFPage, pageH: number, r: RegionEdit, fonts: Font
   const color = hexToRgb(r.color);
   lines.forEach((line, i) => {
     if (!line) return;
-    const w = textWidth(line, r.fontSize, r.bold, fonts);
+    const w = textWidth(line, r.fontSize, r.bold, fonts, custom);
     let lx = r.x + inset;
     if (r.align === 'center') lx = r.x + (r.width - w) / 2;
     else if (r.align === 'right') lx = r.x + r.width - inset - w;
     const baselineY = pageH - (startTop + r.fontSize * 0.85 + i * lineHeight);
-    drawMixed(page, line, lx, baselineY, r.fontSize, color, r.bold, fonts);
+    drawMixed(page, line, lx, baselineY, r.fontSize, color, r.bold, fonts, custom);
   });
 }
 
@@ -207,6 +217,24 @@ export async function exportEditedPdf(
     fonts.cjk = await doc.embedFont(new Uint8Array(await resp.arrayBuffer()));
   }
 
+  // 收集各编辑项选用的字体并嵌入；加载失败直接中止（不悄悄回退）
+  const customById = new Map<string, CustomFont>();
+  const usedFontIds = new Set<string>();
+  for (const p of pages) {
+    for (const s of p.spans) {
+      if (spanDirty(s) && !s.deleted && s.text.trim() && s.fontId) usedFontIds.add(s.fontId);
+    }
+    for (const r of p.regions) {
+      if (r.text.trim() && r.fontId) usedFontIds.add(r.fontId);
+    }
+  }
+  for (const id of usedFontIds) {
+    const lf = await loadFontById(id);
+    const pdfFont = await doc.embedFont(lf.bytes, { subset: lf.subsettable });
+    customById.set(id, { font: pdfFont, covers: (ch) => fontCovers(lf, ch) });
+  }
+  const customFor = (fontId?: string) => (fontId ? customById.get(fontId) : undefined);
+
   const imageCache = new Map<string, PDFImage>();
 
   for (const p of pages) {
@@ -229,9 +257,9 @@ export async function exportEditedPdf(
     }
     for (const r of p.regions) drawRegionFill(page, pageH, r);
     for (const s of p.spans) {
-      if (spanDirty(s) && !s.deleted && s.text.trim()) drawSpanText(page, pageH, s, fonts);
+      if (spanDirty(s) && !s.deleted && s.text.trim()) drawSpanText(page, pageH, s, fonts, customFor(s.fontId));
     }
-    for (const r of p.regions) drawRegionText(page, pageH, r, fonts);
+    for (const r of p.regions) drawRegionText(page, pageH, r, fonts, customFor(r.fontId));
     for (const edit of Object.values(p.elementEdits)) {
       const el = elementsById?.get(edit.elementId);
       if (!el) continue;
