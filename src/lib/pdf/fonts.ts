@@ -194,3 +194,37 @@ export async function ensurePreviewFont(id: string): Promise<string> {
   registeredFaces.add(family);
   return family;
 }
+
+/* ---------------- 预览：默认字体（与导出回退链对齐） ---------------- */
+
+/** 导出时默认 CJK 字体（/fonts/cjk.ttf）的预览 FontFace 名 */
+const DEFAULT_CJK_FAMILY = 'pdfe-default-cjk';
+
+let defaultCjkPromise: Promise<void> | null = null;
+
+/** 注册导出默认中文体的预览 FontFace，保证未选字体时预览与导出一致 */
+export function ensureDefaultCjkPreview(): Promise<void> {
+  if (!defaultCjkPromise) {
+    defaultCjkPromise = (async () => {
+      const resp = await fetch('/fonts/cjk.ttf');
+      if (!resp.ok) throw new Error(`默认中文字体加载失败（${resp.status}）`);
+      const face = new FontFace(DEFAULT_CJK_FAMILY, await resp.arrayBuffer());
+      await face.load();
+      document.fonts.add(face);
+    })();
+    defaultCjkPromise.catch(() => {
+      defaultCjkPromise = null; // 失败不留缓存，允许重试
+    });
+  }
+  return defaultCjkPromise;
+}
+
+/**
+ * 与 exportPdf.ts 的 fontFor() 回退链一致的 CSS font-family 栈：
+ * 自定义字体 → Helvetica（拉丁默认）→ 内置 CJK（中文默认）。
+ * 浏览器按字符逐个回退，预览效果即导出效果。
+ */
+export function previewFontStack(customFamily?: string): string {
+  const base = `Helvetica, "${DEFAULT_CJK_FAMILY}", sans-serif`;
+  return customFamily ? `"${customFamily}", ${base}` : base;
+}

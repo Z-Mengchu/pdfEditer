@@ -4,7 +4,7 @@ import { renderPage, sampleBackground } from '@/lib/pdf/pdfjs';
 import type { ElementEdit, PageState, RegionEdit, Selection, SpanEdit, Tool } from '@/lib/pdf/types';
 import { spanDirty } from '@/lib/pdf/types';
 import { hitTestElements, segsToPathData, partsOf, type VectorElement } from '@/lib/pdf/elements';
-import { ensurePreviewFont } from '@/lib/pdf/fonts';
+import { ensureDefaultCjkPreview, ensurePreviewFont, previewFontStack } from '@/lib/pdf/fonts';
 
 interface PageViewProps {
   doc: PdfDoc;
@@ -56,9 +56,24 @@ function previewUrl(elId: string, bytes: ArrayBuffer): string {
 /** 为带 fontId 的编辑项加载预览字体（FontFace），返回 fontId → CSS font-family */
 function usePreviewFontFamilies(items: (SpanEdit | RegionEdit)[]): Record<string, string> {
   const [families, setFamilies] = useState<Record<string, string>>({});
+  const [, setCjkReady] = useState(false);
   const idsKey = [...new Set(items.map((i) => i.fontId).filter((x): x is string => !!x))]
     .sort()
     .join(',');
+  // 默认 CJK 字体也要注册（未选字体 / 自定义字体缺字时的预览回退，与导出一致）
+  useEffect(() => {
+    let cancelled = false;
+    ensureDefaultCjkPreview()
+      .then(() => {
+        if (!cancelled) setCjkReady(true);
+      })
+      .catch(() => {
+        // 加载失败：预览回退系统字体，导出时再统一报错
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   useEffect(() => {
     if (!idsKey) return;
     let cancelled = false;
@@ -108,7 +123,8 @@ export default function PageView({
   const cssW = page.width * zoom;
   const cssH = page.height * zoom;
   const fontFamilies = usePreviewFontFamilies([...page.spans, ...page.regions]);
-  const familyOf = (fontId?: string) => (fontId ? fontFamilies[fontId] : undefined);
+  // 字体栈与导出回退链一致（选用字体 → Helvetica → 内置 CJK），预览即所得
+  const familyOf = (fontId?: string) => previewFontStack(fontId ? fontFamilies[fontId] : undefined);
 
   useEffect(() => {
     let cancelled = false;
