@@ -257,8 +257,11 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
       const a = document.createElement('a');
       a.href = url;
       a.download = fileName.replace(/\.pdf$/i, '') + '-edited.pdf';
+      document.body.appendChild(a);
       a.click();
-      URL.revokeObjectURL(url);
+      a.remove();
+      // 立刻 revoke 会取消尚未开始的下载，延迟释放
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
       toast.success(changed ? '已导出编辑后的 PDF' : '未检测到修改，已导出原文件');
     } catch (err) {
       console.error(err);

@@ -169,7 +169,7 @@ function FontSelector({
                   </CommandItem>
                 </CommandGroup>
                 <CommandGroup heading="内置字体">
-                  {BUILTIN_FONTS.map((f) => (
+                  {BUILTIN_FONTS.filter((f) => !f.variantOnly).map((f) => (
                     <CommandItem key={f.id} onSelect={() => pick(f.id)}>
                       <Check className={cn('w-4 h-4 mr-1', value === f.id ? 'opacity-100' : 'opacity-0')} />
                       {f.name}
@@ -392,6 +392,10 @@ export default function PropertiesPanel({
                   y: s.oy,
                   width: s.owidth,
                   height: s.oheight,
+                  fontSize: s.ofontSize,
+                  color: s.ocolor,
+                  bgColor: s.obgColor,
+                  bold: s.originalBold,
                   fontId: undefined,
                   deleted: false,
                 })

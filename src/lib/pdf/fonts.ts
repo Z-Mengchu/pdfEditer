@@ -10,6 +10,10 @@ export interface BuiltinFontDef {
   url: string;
   /** 是否允许 pdf-lib 导出时子集嵌入（全集字体为 true，可减小产物体积） */
   subsettable: boolean;
+  /** 真加粗时对应的字体 id（通常为同 family 的 Bold 字重） */
+  boldId?: string;
+  /** 仅作为变体字使用，不在字体下拉列表中展示 */
+  variantOnly?: boolean;
 }
 
 /** 本机字体条目（Local Font Access API） */
@@ -54,14 +58,71 @@ declare global {
 export const BUILTIN_FONTS: BuiltinFontDef[] = [
   { id: 'noto-sans-sc', name: '思源黑体', url: '/fonts/NotoSansSC-Regular.otf', subsettable: true },
   { id: 'noto-serif-sc', name: '思源宋体', url: '/fonts/NotoSerifSC-Regular.otf', subsettable: true },
-  { id: 'ddin', name: 'D-DIN', url: '/fonts/D-DIN.ttf', subsettable: true },
+  { id: 'ddin', name: 'D-DIN', url: '/fonts/D-DIN.ttf', subsettable: true, boldId: 'ddin-bold' },
   { id: 'ddin-bold', name: 'D-DIN Bold', url: '/fonts/D-DIN-Bold.ttf', subsettable: true },
-  { id: 'ddin-pro-regular', name: 'D-DIN PRO', url: '/fonts/D-DIN-PRO-Regular.otf', subsettable: true },
-  { id: 'ddin-pro-semibold', name: 'D-DIN PRO SemiBold', url: '/fonts/D-DIN-PRO-SemiBold.otf', subsettable: true },
+  { id: 'ddin-pro-regular', name: 'D-DIN PRO', url: '/fonts/D-DIN-PRO-Regular.otf', subsettable: true, boldId: 'ddin-pro-bold' },
+  { id: 'ddin-pro-semibold', name: 'D-DIN PRO SemiBold', url: '/fonts/D-DIN-PRO-SemiBold.otf', subsettable: true, boldId: 'ddin-pro-bold' },
+  { id: 'ddin-pro-bold', name: 'D-DIN PRO Bold', url: '/fonts/D-DIN-PRO-Bold.otf', subsettable: true, variantOnly: true },
   { id: 'ddin-pro-heavy', name: 'D-DIN PRO Heavy', url: '/fonts/D-DIN-PRO-Heavy.otf', subsettable: true },
 ];
 
 const builtinById = new Map(BUILTIN_FONTS.map((f) => [f.id, f]));
+
+/** 返回指定内置字体的真加粗变体 id；不存在时返回 undefined（走伪加粗） */
+export function boldVariantIdOf(id: string): string | undefined {
+  const b = builtinById.get(id)?.boldId;
+  return b && builtinById.has(b) ? b : undefined;
+}
+
+/* ---------------- 按原字体名匹配内置字体 ---------------- */
+
+/** 粗字重名判定（与 pdfjs.ts 提取时的 bold 检测保持一致） */
+const BOLD_WEIGHT_RE = /bold|black|heavy|demi|medium/i;
+
+function normalizeFontName(n: string): string {
+  return n.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// 匹配别名表：内置字体的 name/id 归一化结果 → fontId。
+// 按别名长度降序，保证 'ddinprosemibold' 先于 'ddinpro' 命中。
+const builtinAliases: { alias: string; id: string }[] = BUILTIN_FONTS.flatMap((f) => [
+  { alias: normalizeFontName(f.name), id: f.id },
+  { alias: normalizeFontName(f.id), id: f.id },
+])
+  .filter((a) => a.alias.length >= 4)
+  .sort((a, b) => b.alias.length - a.alias.length);
+
+/** 按 PDF 原字体名（如 "ABCDEF+D-DINPRO-SemiBold"）匹配内置字体 id；匹配不到返回 undefined */
+export function matchBuiltinFontId(originalFontName?: string): string | undefined {
+  if (!originalFontName) return undefined;
+  const n = normalizeFontName(originalFontName.replace(/^[A-Z]{6}\+/, ''));
+  if (!n) return undefined;
+  for (const { alias, id } of builtinAliases) {
+    if (n === alias || n.includes(alias)) return id;
+  }
+  return undefined;
+}
+
+/** 该内置字体文件本身是否就是粗字重（自动匹配到时无需再叠加加粗） */
+export function isBoldWeightFontId(id: string): boolean {
+  const def = builtinById.get(id);
+  return !!def && BOLD_WEIGHT_RE.test(def.name);
+}
+
+/**
+ * 预览/导出共用的字体回退链：显式 fontId → 按原字体名匹配内置库 → 默认字体。
+ * 自动匹配到的字体文件本身就是原字重（如 SemiBold/Bold），此时把 bold 置 false，
+ * 避免在原字重上再叠加真加粗/伪加粗导致双重加粗。
+ */
+export function resolveFontChoice(
+  fontId: string | undefined,
+  originalFontName: string | undefined,
+  bold: boolean,
+): { fontId?: string; bold: boolean } {
+  if (fontId) return { fontId, bold };
+  const auto = matchBuiltinFontId(originalFontName);
+  return { fontId: auto, bold: auto ? bold && !isBoldWeightFontId(auto) : bold };
+}
 
 /* ---------------- 本机字体枚举 ---------------- */
 
@@ -183,15 +244,30 @@ function cssFamilyFor(id: string): string {
 /**
  * 确保字体已注册为 FontFace（供预览 DOM 的 fontFamily 使用）。
  * 返回 CSS font-family 名。加载/注册过程与 loadFontById 共享缓存。
+ * 若该字体有 boldId 变体，会一并注册为同 family 的 700 权重，使 font-weight: 700 使用真粗体。
  */
 export async function ensurePreviewFont(id: string): Promise<string> {
   const family = cssFamilyFor(id);
   if (registeredFaces.has(family)) return family;
   const lf = await loadFontById(id);
-  const face = new FontFace(family, lf.bytes as unknown as ArrayBuffer);
+  const face = new FontFace(family, lf.bytes as unknown as ArrayBuffer, { weight: '400' });
   await face.load();
   document.fonts.add(face);
   registeredFaces.add(family);
+
+  const boldId = boldVariantIdOf(id);
+  if (boldId) {
+    try {
+      const blf = await loadFontById(boldId);
+      const boldFace = new FontFace(family, blf.bytes as unknown as ArrayBuffer, { weight: '700' });
+      await boldFace.load();
+      document.fonts.add(boldFace);
+    } catch {
+      // 变体字缺失或加载失败：回退到浏览器合成加粗，保持兼容
+      console.warn(`字体加粗变体加载失败：${boldId}，将使用合成加粗`);
+    }
+  }
+
   return family;
 }
 

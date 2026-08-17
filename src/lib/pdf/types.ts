@@ -18,15 +18,35 @@ export interface SpanEdit {
   originalText: string;
   text: string;
   fontSize: number;
+  /** 原始字号（spanDirty 判断用） */
+  ofontSize: number;
   /** 文字颜色 #rrggbb */
   color: string;
+  /** 原始文字颜色（spanDirty 判断用） */
+  ocolor: string;
   /** 擦除原文时使用的背景色（采样自原文周围） */
   bgColor: string;
+  /** 原始背景色（spanDirty 判断用） */
+  obgColor: string;
   bold: boolean;
+  /** 解析 PDF 时识别出的原始加粗状态，用于判断 spanDirty */
+  originalBold: boolean;
   /** 选用的字体（fonts.ts 的 fontId）；undefined = 默认 Helvetica/文泉驿 */
   fontId?: string;
   /** 解析 PDF 时识别出的原字体名（仅展示用） */
   originalFontName?: string;
+  /** 原文字距 Tc（pt，默认 0）；非用户可编辑，不参与 spanDirty */
+  charSpacing?: number;
+  /** 原词距 Tw（pt，默认 0，仅对空格生效） */
+  wordSpacing?: number;
+  /** 原水平缩放 Tz（百分比，默认 100 = 无缩放） */
+  hScale?: number;
+  /** 原渲染模式 Tr（默认 0=填充；1/5=描边，2/6=填充+描边，3=不可见） */
+  renderingMode?: number;
+  /** 原描边色 #rrggbb（描边渲染模式下使用） */
+  strokeColor?: string;
+  /** 原描边线宽（pt） */
+  strokeLineWidth?: number;
   /** 已删除 = 导出时仅擦除 */
   deleted: boolean;
 }
@@ -98,6 +118,10 @@ export function spanDirty(s: SpanEdit): boolean {
     s.deleted ||
     s.fontId != null ||
     s.text !== s.originalText ||
+    s.bold !== s.originalBold ||
+    s.fontSize !== s.ofontSize ||
+    s.color !== s.ocolor ||
+    s.bgColor !== s.obgColor ||
     s.x !== s.ox ||
     s.y !== s.oy ||
     s.width !== s.owidth ||

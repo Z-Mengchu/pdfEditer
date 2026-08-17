@@ -3,7 +3,7 @@ import fontkit from '@pdf-lib/fontkit';
 import type { PageState, RegionEdit, SpanEdit } from './types';
 import { spanDirty } from './types';
 import { segsToPathData, partsOf, type VectorElement } from './elements';
-import { fontCovers, loadFontById } from './fonts';
+import { boldVariantIdOf, fontCovers, loadFontById, resolveFontChoice } from './fonts';
 
 function hexToRgb(hex: string): RGB {
   const n = parseInt(hex.replace('#', ''), 16);
@@ -26,10 +26,16 @@ interface Fonts {
 interface CustomFont {
   font: PDFFont;
   covers: (ch: string) => boolean;
+  /** 真加粗变体（可选） */
+  bold?: PDFFont;
+  boldCovers?: (ch: string) => boolean;
 }
 
 function fontFor(ch: string, bold: boolean, fonts: Fonts, custom?: CustomFont): PDFFont {
-  if (custom?.covers(ch)) return custom.font;
+  if (custom?.covers(ch)) {
+    if (bold && custom.bold && custom.boldCovers?.(ch)) return custom.bold;
+    return custom.font;
+  }
   if (needsCjk(ch)) {
     if (!fonts.cjk) throw new Error(`字符 "${ch}" 需要中文字体，但字体未加载`);
     return fonts.cjk;
@@ -45,6 +51,55 @@ function textWidth(text: string, size: number, bold: boolean, fonts: Fonts, cust
   return w;
 }
 
+/** 逐字符 advance 补偿：Tc 字距、Tw 词距（仅空格）、Tz 水平缩放、残差摊分 pad */
+interface TrackOpts {
+  cs: number;
+  ws: number;
+  /** 百分比，100 = 无缩放 */
+  hs: number;
+  pad: number;
+}
+
+const NO_TRACK: TrackOpts = { cs: 0, ws: 0, hs: 100, pad: 0 };
+
+/** 单个字符的绘制字体与伪加粗标记（drawMixed 与宽度测量共用） */
+function charMetrics(ch: string, bold: boolean, fonts: Fonts, custom?: CustomFont) {
+  const usedCustom = !!custom?.covers(ch);
+  const font = fontFor(ch, bold, fonts, custom);
+  // 中文字体和自定义字体无粗体字重时，双绘模拟加粗；有真粗体变体则跳过伪加粗
+  const realBold = bold && usedCustom && !!custom?.bold && !!custom.boldCovers?.(ch);
+  const faux = bold && !realBold && (usedCustom || needsCjk(ch));
+  return { font, faux };
+}
+
+function advanceOf(font: PDFFont, faux: boolean, ch: string, size: number, t: TrackOpts): number {
+  return (
+    font.widthOfTextAtSize(ch, size) * (t.hs / 100) +
+    t.cs +
+    t.pad +
+    (ch === ' ' ? t.ws : 0) +
+    (faux ? size * 0.028 : 0)
+  );
+}
+
+/** 与 drawMixed 相同口径的宽度测量（用于残差摊分） */
+function trackedWidth(
+  text: string,
+  size: number,
+  bold: boolean,
+  fonts: Fonts,
+  custom: CustomFont | undefined,
+  t: TrackOpts,
+): number {
+  let w = 0;
+  for (const ch of text) {
+    if (ch === '\n') continue;
+    const { font, faux } = charMetrics(ch, bold, fonts, custom);
+    w += advanceOf(font, faux, ch, size, t);
+  }
+  return w;
+}
+
 /** 按 run 拆分（拉丁 / 非拉丁），逐段绘制，支持 faux-bold */
 function drawMixed(
   page: PDFPage,
@@ -56,19 +111,17 @@ function drawMixed(
   bold: boolean,
   fonts: Fonts,
   custom?: CustomFont,
+  t: TrackOpts = NO_TRACK,
 ): number {
   let cx = x;
   for (const ch of text) {
     if (ch === '\n') continue;
-    const usedCustom = !!custom?.covers(ch);
-    const font = fontFor(ch, bold, fonts, custom);
-    // 中文字体和自定义字体无粗体字重，双绘模拟加粗；拉丁回退字符用真粗体
-    const faux = bold && (usedCustom || needsCjk(ch));
+    const { font, faux } = charMetrics(ch, bold, fonts, custom);
     page.drawText(ch, { x: cx, y: baselineY, size, font, color });
     if (faux) {
       page.drawText(ch, { x: cx + size * 0.028, y: baselineY, size, font, color });
     }
-    cx += font.widthOfTextAtSize(ch, size) + (faux ? size * 0.028 : 0);
+    cx += advanceOf(font, faux, ch, size, t);
   }
   return cx - x;
 }
@@ -132,10 +185,53 @@ function erase(page: PDFPage, pageH: number, x: number, y: number, w: number, h:
 function drawSpanText(page: PDFPage, pageH: number, s: SpanEdit, fonts: Fonts, custom?: CustomFont) {
   const color = hexToRgb(s.color);
   const lineHeight = s.fontSize * 1.2;
+  const t: TrackOpts = {
+    cs: s.charSpacing ?? 0,
+    ws: s.wordSpacing ?? 0,
+    hs: s.hScale ?? 100,
+    pad: 0,
+  };
+  // 纯改样式（文字未变）时，字体度量差异导致的残差按比例摊到逐字符 advance，
+  // 使重绘总宽精确等于原宽，与擦除矩形对齐；残差过大则放弃摊分防止异常拉伸
+  if (s.text === s.originalText && !s.text.includes('\n')) {
+    const chars = [...s.text];
+    if (chars.length > 0) {
+      const base = trackedWidth(s.text, s.fontSize, s.bold, fonts, custom, t);
+      const residual = s.width - base;
+      if (Math.abs(residual) <= s.width * 0.5) t.pad = residual / chars.length;
+    }
+  }
+  // 描边渲染模式（Tr=1/2/5/6，原文伪粗体）：描边色在下层四方向微偏移画光晕，填充色盖上面
+  const rm = s.renderingMode ?? 0;
+  const strokeOnly = rm === 1 || rm === 5;
+  const fillAndStroke = rm === 2 || rm === 6;
+  const strokeRgb = hexToRgb(s.strokeColor ?? s.color);
+  const strokeOff = (s.strokeLineWidth ?? s.fontSize * 0.03) / 2;
   s.text.split('\n').forEach((line, i) => {
     if (!line) return;
     const baselineY = pageH - (s.y + s.baseline + i * lineHeight);
-    drawMixed(page, line, s.x, baselineY, s.fontSize, color, s.bold, fonts, custom);
+    if (fillAndStroke) {
+      for (const [dx, dy] of [
+        [-strokeOff, 0],
+        [strokeOff, 0],
+        [0, -strokeOff],
+        [0, strokeOff],
+      ]) {
+        drawMixed(page, line, s.x + dx, baselineY + dy, s.fontSize, strokeRgb, s.bold, fonts, custom, t);
+      }
+    }
+    drawMixed(
+      page,
+      line,
+      s.x,
+      baselineY,
+      s.fontSize,
+      strokeOnly ? strokeRgb : color,
+      s.bold,
+      fonts,
+      custom,
+      t,
+    );
   });
 }
 
@@ -179,11 +275,48 @@ export interface ExportResult {
   changed: boolean;
 }
 
+/**
+ * fontkit 的子集编码在 nextTick 回调里抛错时会逃逸成未捕获异常
+ * （不 reject、stream 也不 emit error），导致 pdf-lib 的 save() 永远 pending，
+ * 表现为导出按钮一直转圈。这里把全局 error 事件转成 rejection，交给上层降级重试。
+ */
+async function saveDoc(doc: PDFDocument): Promise<Uint8Array> {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return doc.save();
+  }
+  let onError: ((e: ErrorEvent) => void) | null = null;
+  const trap = new Promise<never>((_, reject) => {
+    onError = (e: ErrorEvent) => reject(e.error instanceof Error ? e.error : new Error(e.message));
+    window.addEventListener('error', onError);
+  });
+  try {
+    return await Promise.race([doc.save(), trap]);
+  } finally {
+    if (onError) window.removeEventListener('error', onError);
+  }
+}
+
 /** 把所有编辑应用到原 PDF 并导出 */
 export async function exportEditedPdf(
   originalBytes: Uint8Array,
   pages: PageState[],
   elementsById?: Map<string, VectorElement>,
+): Promise<ExportResult> {
+  try {
+    return await applyEdits(originalBytes, pages, elementsById, true);
+  } catch (err) {
+    // fontkit 对部分字体/字符（如 CFF 字体含康熙部首 U+2F00 段字符）子集化会崩溃，
+    // 关闭子集化（整体嵌入，产物更大）重试一次，保证导出一定完成
+    console.warn('[导出] 子集化导出失败，改为整体嵌入字体后重试：', err);
+    return applyEdits(originalBytes, pages, elementsById, false);
+  }
+}
+
+async function applyEdits(
+  originalBytes: Uint8Array,
+  pages: PageState[],
+  elementsById: Map<string, VectorElement> | undefined,
+  useSubset: boolean,
 ): Promise<ExportResult> {
   const doc = await PDFDocument.load(originalBytes, { ignoreEncryption: true });
   doc.registerFontkit(fontkit);
@@ -217,12 +350,15 @@ export async function exportEditedPdf(
     fonts.cjk = await doc.embedFont(new Uint8Array(await resp.arrayBuffer()));
   }
 
-  // 收集各编辑项选用的字体并嵌入；加载失败直接中止（不悄悄回退）
+  // 收集各编辑项选用的字体并嵌入；加载失败直接中止（不悄悄回退）。
+  // 未显式选字体的 span 按原字体名自动匹配内置字体库（如 D-DIN PRO），保持与原文观感一致
   const customById = new Map<string, CustomFont>();
   const usedFontIds = new Set<string>();
   for (const p of pages) {
     for (const s of p.spans) {
-      if (spanDirty(s) && !s.deleted && s.text.trim() && s.fontId) usedFontIds.add(s.fontId);
+      if (!spanDirty(s) || s.deleted || !s.text.trim()) continue;
+      const fid = resolveFontChoice(s.fontId, s.originalFontName, s.bold).fontId;
+      if (fid) usedFontIds.add(fid);
     }
     for (const r of p.regions) {
       if (r.text.trim() && r.fontId) usedFontIds.add(r.fontId);
@@ -230,8 +366,19 @@ export async function exportEditedPdf(
   }
   for (const id of usedFontIds) {
     const lf = await loadFontById(id);
-    const pdfFont = await doc.embedFont(lf.bytes, { subset: lf.subsettable });
-    customById.set(id, { font: pdfFont, covers: (ch) => fontCovers(lf, ch) });
+    const pdfFont = await doc.embedFont(lf.bytes, { subset: useSubset && lf.subsettable });
+    const entry: CustomFont = { font: pdfFont, covers: (ch) => fontCovers(lf, ch) };
+    const boldId = boldVariantIdOf(id);
+    if (boldId) {
+      try {
+        const blf = await loadFontById(boldId);
+        entry.bold = await doc.embedFont(blf.bytes, { subset: useSubset && blf.subsettable });
+        entry.boldCovers = (ch) => fontCovers(blf, ch);
+      } catch {
+        // 加粗变体缺失/损坏时静默降级为伪加粗，不影响导出流程
+      }
+    }
+    customById.set(id, entry);
   }
   const customFor = (fontId?: string) => (fontId ? customById.get(fontId) : undefined);
 
@@ -257,7 +404,10 @@ export async function exportEditedPdf(
     }
     for (const r of p.regions) drawRegionFill(page, pageH, r);
     for (const s of p.spans) {
-      if (spanDirty(s) && !s.deleted && s.text.trim()) drawSpanText(page, pageH, s, fonts, customFor(s.fontId));
+      if (spanDirty(s) && !s.deleted && s.text.trim()) {
+        const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold);
+        drawSpanText(page, pageH, { ...s, bold: rf.bold }, fonts, customFor(rf.fontId));
+      }
     }
     for (const r of p.regions) drawRegionText(page, pageH, r, fonts, customFor(r.fontId));
     for (const edit of Object.values(p.elementEdits)) {
@@ -300,6 +450,6 @@ export async function exportEditedPdf(
     }
   }
 
-  const bytes = await doc.save();
+  const bytes = await saveDoc(doc);
   return { bytes, changed };
 }

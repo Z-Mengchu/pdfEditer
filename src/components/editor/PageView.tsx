@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import type { PdfDoc } from '@/lib/pdf/pdfjs';
 import { renderPage, sampleBackground } from '@/lib/pdf/pdfjs';
 import type { ElementEdit, PageState, RegionEdit, Selection, SpanEdit, Tool } from '@/lib/pdf/types';
-import { spanDirty } from '@/lib/pdf/types';
+import { isSpan, spanDirty } from '@/lib/pdf/types';
 import { hitTestElements, segsToPathData, partsOf, type VectorElement } from '@/lib/pdf/elements';
-import { ensureDefaultCjkPreview, ensurePreviewFont, previewFontStack } from '@/lib/pdf/fonts';
+import { ensureDefaultCjkPreview, ensurePreviewFont, previewFontStack, resolveFontChoice } from '@/lib/pdf/fonts';
 
 interface PageViewProps {
   doc: PdfDoc;
@@ -57,7 +57,14 @@ function previewUrl(elId: string, bytes: ArrayBuffer): string {
 function usePreviewFontFamilies(items: (SpanEdit | RegionEdit)[]): Record<string, string> {
   const [families, setFamilies] = useState<Record<string, string>>({});
   const [, setCjkReady] = useState(false);
-  const idsKey = [...new Set(items.map((i) => i.fontId).filter((x): x is string => !!x))]
+  // 未显式选字体的 span 也按原字体名匹配内置库加载预览字体，与导出回退链一致
+  const idsKey = [
+    ...new Set(
+      items
+        .map((i) => resolveFontChoice(i.fontId, isSpan(i) ? i.originalFontName : undefined, false).fontId)
+        .filter((x): x is string => !!x),
+    ),
+  ]
     .sort()
     .join(',');
   // 默认 CJK 字体也要注册（未选字体 / 自定义字体缺字时的预览回退，与导出一致）
@@ -128,14 +135,27 @@ export default function PageView({
 
   useEffect(() => {
     let cancelled = false;
+    let task: { cancel(): void } | null = null;
     setRendering(true);
     const canvas = canvasRef.current;
     if (!canvas) return;
-    renderPage(doc, page.pageIndex, canvas, Math.min(zoom * 2, 5)).then(() => {
-      if (!cancelled) setRendering(false);
-    });
+    // 按设备像素比渲染：canvas 物理像素 = CSS 尺寸 × dpr，避免浏览器二次缩放导致模糊/偏色
+    const dpr = window.devicePixelRatio || 1;
+    renderPage(doc, page.pageIndex, canvas, Math.min(zoom * dpr, 8), (t) => {
+      // StrictMode 下 effect 会先执行一次再清理重跑：若已清理则立即取消，释放 canvas 给下一次渲染
+      if (cancelled) t.cancel();
+      else task = t;
+    })
+      .then(() => {
+        if (!cancelled) setRendering(false);
+      })
+      .catch(() => {
+        // 渲染被取消或失败都要摘掉“渲染中”遮罩，否则会永久卡住
+        if (!cancelled) setRendering(false);
+      });
     return () => {
       cancelled = true;
+      task?.cancel();
     };
   }, [doc, page.pageIndex, zoom]);
 
@@ -398,6 +418,10 @@ export default function PageView({
   /* ---------- 内联文本编辑（受控输入，边打字边提交，避免失焦时序问题） ---------- */
   const renderEditor = (item: SpanEdit | RegionEdit) => {
     const isRegion = item.kind === 'region';
+    // span 走与导出一致的字体回退链（原字体名匹配内置库 + 字重修正）
+    const rf = isRegion
+      ? { fontId: item.fontId, bold: item.bold }
+      : resolveFontChoice(item.fontId, item.originalFontName, item.bold);
     const commit = (v: string) => {
       if (item.kind === 'span') onUpdateSpan(item.id, { text: v });
       else onUpdateRegion(item.id, { text: v });
@@ -414,8 +438,8 @@ export default function PageView({
           height: isRegion ? item.height * zoom : Math.max(item.height * zoom, item.fontSize * zoom * 1.6),
           fontSize: item.fontSize * zoom,
           lineHeight: 1.2,
-          fontWeight: item.bold ? 700 : 400,
-          fontFamily: familyOf(item.fontId),
+          fontWeight: rf.bold ? 700 : 400,
+          fontFamily: familyOf(rf.fontId),
           color: item.color,
         }}
         onChange={(e) => commit(e.currentTarget.value)}
@@ -435,6 +459,7 @@ export default function PageView({
     if (editingId === s.id) return renderEditor(s);
     const dirty = spanDirty(s);
     const selected = selection?.kind === 'span' && selection.id === s.id;
+    const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold);
     return (
       <div
         key={s.id}
@@ -463,8 +488,12 @@ export default function PageView({
               color: s.color,
               fontSize: s.fontSize * zoom,
               lineHeight: 1.2,
-              fontWeight: s.bold ? 700 : 400,
-              fontFamily: familyOf(s.fontId),
+              fontWeight: rf.bold ? 700 : 400,
+              fontFamily: familyOf(rf.fontId),
+              letterSpacing: s.charSpacing ? `${s.charSpacing * zoom}px` : undefined,
+              ...(s.hScale != null && s.hScale !== 100
+                ? { transform: `scaleX(${s.hScale / 100})`, transformOrigin: 'left top' }
+                : {}),
               padding: 0,
               minWidth: '100%',
               minHeight: '100%',
