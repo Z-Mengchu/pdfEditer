@@ -7,6 +7,10 @@ import { inspectAttr } from 'kimi-plugin-inspect-react'
 export default defineConfig({
   base: './',
   plugins: [inspectAttr(), react()],
+  build: {
+    // Keep the production bundle compatible with older Chromium releases.
+    target: 'es2020',
+  },
   server: {
     port: 3000,
   },

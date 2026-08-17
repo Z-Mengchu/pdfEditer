@@ -40,3 +40,4 @@ Desktop.ini
 
 # Local-only files
 *.local
+/ai/
