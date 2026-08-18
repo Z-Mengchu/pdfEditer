@@ -8,11 +8,22 @@ import {
   PaintBucket,
   Shapes,
   Type,
+  Upload,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { loadPdf, renderPage, getPageViewport, extractSpans, type PdfDoc } from '@/lib/pdf/pdfjs';
 import { exportEditedPdf } from '@/lib/pdf/exportPdf';
 import { extractRawGraphics, clusterElements, type VectorElement } from '@/lib/pdf/elements';
@@ -69,6 +80,7 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
 
   /* ---------- 初始化：解析所有页 ---------- */
   useEffect(() => {
@@ -246,6 +258,24 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
     [pages],
   );
 
+  /* ---------- 重新选择文件 ---------- */
+  const requestReset = useCallback(() => {
+    if (changeCount > 0) {
+      setResetDialogOpen(true);
+    } else {
+      onReset();
+    }
+  }, [changeCount, onReset]);
+
+  const confirmReset = useCallback(() => {
+    setResetDialogOpen(false);
+    onReset();
+  }, [onReset]);
+
+  const cancelReset = useCallback(() => {
+    setResetDialogOpen(false);
+  }, []);
+
   /* ---------- 导出 ---------- */
   const doExport = async () => {
     if (pages.length === 0) return;
@@ -273,9 +303,29 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
 
   if (!doc || pages.length === 0) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-3 text-muted-foreground">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-        <p className="text-sm">{initMsg}</p>
+      <div className="h-screen flex flex-col bg-slate-100 overflow-hidden">
+        <header className="h-14 bg-white border-b flex items-center gap-2 px-3 shrink-0">
+          <button
+            onClick={requestReset}
+            className="flex items-center gap-1.5 text-sm font-semibold mr-1 hover:text-blue-600"
+          >
+            <FileText className="w-5 h-5 text-blue-600" />
+            <span className="hidden lg:inline">PDF 编辑器</span>
+          </button>
+          <Separator orientation="vertical" className="h-6" />
+          <span className="text-sm text-muted-foreground truncate max-w-48" title={fileName}>
+            {fileName}
+          </span>
+          <div className="flex-1" />
+          <Button variant="ghost" size="sm" onClick={requestReset} className="text-slate-600">
+            <Upload className="w-4 h-4 mr-1.5" />
+            <span className="hidden md:inline">重新选择文件</span>
+          </Button>
+        </header>
+        <main className="flex-1 flex flex-col items-center justify-center gap-3 text-muted-foreground">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+          <p className="text-sm">{initMsg}</p>
+        </main>
       </div>
     );
   }
@@ -299,7 +349,11 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
     <div className="h-screen flex flex-col bg-slate-100 overflow-hidden">
       {/* 工具栏 */}
       <header className="h-14 bg-white border-b flex items-center gap-2 px-3 shrink-0">
-        <button onClick={onReset} className="flex items-center gap-1.5 text-sm font-semibold mr-1 hover:text-blue-600">
+        <button
+          onClick={requestReset}
+          className="flex items-center gap-1.5 text-sm font-semibold mr-1 hover:text-blue-600"
+          title="重新选择文件"
+        >
           <FileText className="w-5 h-5 text-blue-600" />
           <span className="hidden lg:inline">PDF 编辑器</span>
         </button>
@@ -307,6 +361,11 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
         <span className="text-sm text-muted-foreground truncate max-w-48" title={fileName}>
           {fileName}
         </span>
+        <Separator orientation="vertical" className="h-6" />
+        <Button variant="ghost" size="sm" onClick={requestReset} className="text-slate-600">
+          <Upload className="w-4 h-4 mr-1.5" />
+          <span className="hidden md:inline">重新选择文件</span>
+        </Button>
         <Separator orientation="vertical" className="h-6" />
         <div className="flex items-center gap-1">
           {toolBtn('select', <MousePointer2 className="w-4 h-4" />, '选择')}
@@ -395,6 +454,21 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
           />
         </aside>
       </div>
+
+      <AlertDialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>重新选择文件？</AlertDialogTitle>
+            <AlertDialogDescription>
+              当前有 {changeCount} 处修改尚未导出，重新选择文件将丢弃这些修改。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={cancelReset}>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmReset}>继续</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
