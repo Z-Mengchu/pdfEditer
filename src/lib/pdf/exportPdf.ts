@@ -4,6 +4,7 @@ import type { PageState, RegionEdit, SpanEdit } from './types';
 import { spanDirty } from './types';
 import { segsToPathData, partsOf, type VectorElement } from './elements';
 import { boldVariantIdOf, fontCovers, loadFontById, resolveFontChoice } from './fonts';
+import { applyTextRedaction } from './redact';
 
 function hexToRgb(hex: string): RGB {
   const n = parseInt(hex.replace('#', ''), 16);
@@ -322,6 +323,15 @@ async function applyEdits(
   doc.registerFontkit(fontkit);
   const pdfPages = doc.getPages();
 
+  // 优先把被修改/删除文字的原始算子从内容流中真正移除（不破坏背景）；
+  // 返回成功的 spanId 集合，未命中的 span 仍走下面的底色遮盖降级路径
+  let redactedSpans = new Set<string>();
+  try {
+    redactedSpans = applyTextRedaction(doc, pages);
+  } catch (err) {
+    console.warn('[导出] 内容流改写失败，全部降级为底色遮盖：', err);
+  }
+
   let changed = false;
   let cjkNeeded = false;
   for (const p of pages) {
@@ -392,6 +402,7 @@ async function applyEdits(
     // 1) 所有擦除 → 2) 区域底色 → 3) 文字 → 4) 元素替换/移动重绘
     for (const s of p.spans) {
       if (!spanDirty(s)) continue;
+      if (redactedSpans.has(s.id)) continue; // 原文已从内容流移除，无需遮盖
       erase(page, pageH, s.ox, s.oy, s.owidth, s.oheight, s.bgColor);
     }
     for (const edit of Object.values(p.elementEdits)) {

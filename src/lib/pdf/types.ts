@@ -49,6 +49,8 @@ export interface SpanEdit {
   strokeColor?: string;
   /** 原描边线宽（pt） */
   strokeLineWidth?: number;
+  /** 内容流对齐信息：贡献该文字块的显示算子序号（redact.ts 用，不参与 spanDirty） */
+  textOps?: number[];
   /** 已删除 = 导出时仅擦除 */
   deleted: boolean;
 }
@@ -99,6 +101,10 @@ export interface PageState {
   regions: RegionEdit[];
   /** 元素级编辑，key 为 elementId */
   elementEdits: Record<string, ElementEdit>;
+  /** 本页文本显示算子总数（pdf.js 算子流口径，redact.ts 对齐校验用） */
+  textOpCount?: number;
+  /** 起点可精确定位的算子原点（pt，左上角原点；key 为算子序号） */
+  opOrigins?: Record<number, { x: number; y: number }>;
 }
 
 export type EditItem = SpanEdit | RegionEdit;

@@ -14,6 +14,8 @@ interface PageViewProps {
   tool: Tool;
   selection: Selection;
   editingId: string | null;
+  /** 内容流改写成功的 spanId：这些 span 的原文已不在画布上，覆盖层无需遮盖底色 */
+  redactedIds: Set<string>;
   onSelect: (sel: Selection | null) => void;
   onStartEdit: (id: string | null) => void;
   onToolDone: () => void;
@@ -116,6 +118,7 @@ export default function PageView({
   tool,
   selection,
   editingId,
+  redactedIds,
   onSelect,
   onStartEdit,
   onToolDone,
@@ -430,12 +433,16 @@ export default function PageView({
       if (item.kind === 'span') onUpdateSpan(item.id, { text: v });
       else onUpdateRegion(item.id, { text: v });
     };
+    // 编辑期间画布可能还是旧的（预览重渲染有防抖），用采样底色盖住原文避免重影；
+    // 失焦后画布刷新，静态覆盖层对已成功改写的 span 走透明底（见 renderSpan）
+    const coverBg = item.kind === 'span' ? item.bgColor : undefined;
     return (
       <textarea
         autoFocus
         value={item.text}
-        className="absolute bg-white/95 text-black outline-none ring-2 ring-blue-500 rounded-sm resize-none overflow-hidden p-0 m-0 z-30"
+        className={`absolute ${item.kind === 'span' ? '' : 'bg-white/95'} text-black outline-none ring-2 ring-blue-500 rounded-sm resize-none overflow-hidden p-0 m-0 z-30`}
         style={{
+          backgroundColor: coverBg,
           left: item.x * zoom,
           top: item.y * zoom,
           width: Math.max(item.width * zoom, 60),
@@ -488,7 +495,8 @@ export default function PageView({
             style={{
               left: 0,
               top: 0,
-              backgroundColor: s.bgColor,
+              // 原文已从内容流移除（画布上不存在）→ 透明底直接画新文字；否则用采样底色遮盖
+              backgroundColor: redactedIds.has(s.id) ? 'transparent' : s.bgColor,
               color: s.color,
               fontSize: s.fontSize * zoom,
               lineHeight: 1.2,

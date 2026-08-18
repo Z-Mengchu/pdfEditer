@@ -27,6 +27,8 @@ import {
 import { loadPdf, renderPage, getPageViewport, extractSpans, type PdfDoc } from '@/lib/pdf/pdfjs';
 import { clearEmbeddedFonts } from '@/lib/pdf/fonts';
 import { exportEditedPdf } from '@/lib/pdf/exportPdf';
+import { applyTextRedaction } from '@/lib/pdf/redact';
+import { PDFDocument } from 'pdf-lib';
 import { extractRawGraphics, clusterElements, type VectorElement } from '@/lib/pdf/elements';
 import type { EditItem, ElementEdit, PageState, RegionEdit, Selection, SpanEdit, Tool } from '@/lib/pdf/types';
 import { elementEditActive, spanDirty } from '@/lib/pdf/types';
@@ -82,6 +84,11 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  /** 文字改写后的预览文档（内容流中原文已移除）；null = 无文字修改，用原文档渲染 */
+  const [previewDoc, setPreviewDoc] = useState<PdfDoc | null>(null);
+  /** 内容流改写成功的 spanId（预览覆盖层不再画遮盖底色） */
+  const [redactedIds, setRedactedIds] = useState<Set<string>>(new Set());
+  const previewSeq = useRef(0);
 
   /* ---------- 初始化：解析所有页 ---------- */
   useEffect(() => {
@@ -99,7 +106,7 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
           const vp = await getPageViewport(d, i, 1);
           const off = document.createElement('canvas');
           await renderPage(d, i, off, 2);
-          const spans = await extractSpans(d, i, off, 2);
+          const { spans, textOpCount, opOrigins } = await extractSpans(d, i, off, 2);
           const pdfPage = await d.getPage(i + 1);
           const raw = await extractRawGraphics(pdfPage);
           elsPerPage.push(clusterElements(raw.paths, raw.images, i, vp.height));
@@ -110,6 +117,8 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
             spans,
             regions: [],
             elementEdits: {},
+            textOpCount,
+            opOrigins,
           });
           if (cancelled) return;
         }
@@ -128,6 +137,45 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bytes]);
+
+  /* ---------- 文字修改 → 防抖重建「原文已移除」的预览文档 ---------- */
+  const hasSpanEdits = useMemo(() => pages.some((p) => p.spans.some(spanDirty)), [pages]);
+  useEffect(() => {
+    if (!hasSpanEdits) {
+      setPreviewDoc((prev) => {
+        prev?.destroy();
+        return null;
+      });
+      setRedactedIds(new Set());
+      return;
+    }
+    const seq = ++previewSeq.current;
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const redDoc = await PDFDocument.load(bytes.slice(0), { ignoreEncryption: true });
+          const ids = applyTextRedaction(redDoc, pages);
+          const out = await redDoc.save();
+          const buf = out.slice().buffer as ArrayBuffer;
+          const pdoc = await loadPdf(buf);
+          if (previewSeq.current !== seq) {
+            pdoc.destroy(); // 过期结果，丢弃
+            return;
+          }
+          setRedactedIds(ids);
+          setPreviewDoc((prev) => {
+            prev?.destroy();
+            return pdoc;
+          });
+        } catch (err) {
+          // 改写失败：previewDoc 保持原样，界面按降级逻辑用底色遮盖
+          console.warn('[预览] 内容流改写失败，保持遮盖预览：', err);
+        }
+      })();
+    }, 300);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pages, hasSpanEdits]);
 
   /* ---------- 编辑操作 ---------- */
   const updateSpan = useCallback((id: string, patch: Partial<SpanEdit>) => {
@@ -419,13 +467,14 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
         <main className="flex-1 overflow-auto flex items-start justify-center p-8" onClick={() => setSelection(null)}>
           <div onClick={(e) => e.stopPropagation()}>
             <PageView
-              doc={doc}
+              doc={previewDoc ?? doc}
               page={page}
               elements={pageElements[current] ?? []}
               zoom={zoom}
               tool={tool}
               selection={selection}
               editingId={editingId}
+              redactedIds={redactedIds}
               onSelect={setSelection}
               onStartEdit={setEditingId}
               onToolDone={() => setTool('select')}

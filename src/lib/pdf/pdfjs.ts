@@ -211,6 +211,15 @@ function normForMatch(s: string): string {
   return s.normalize('NFKC').replace(/\s+/g, '');
 }
 
+/** item 与算子的对齐结果：图形状态 + 贡献算子序号 + 起点算子（其原点 = item 原点） */
+export interface ItemAlign {
+  st: TextGraphicsState | null;
+  /** 贡献该 item 的算子序号（含跨 item 的前序算子）；对齐失败为 null */
+  ops: number[] | null;
+  /** item 首字符恰好是某算子的起点时，该算子序号；否则 null（item 起于算子中段） */
+  startOp: number | null;
+}
+
 /**
  * 把每个文本显示算子的状态对齐到 getTextContent 的 item。
  * 两边不是一一对应：getTextContent 会把多个连续 Tj 合并成一个 item，
@@ -219,11 +228,12 @@ function normForMatch(s: string): string {
  * 取贡献该 item 第一个字符的算子状态；对不上的 item 置 null（调用方按 span 回退像素采样），
  * 失步后在后续算子中扫描重同步，彻底失败则剩余 item 全部为 null。
  */
-function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): (TextGraphicsState | null)[] {
-  const out: (TextGraphicsState | null)[] = new Array(items.length).fill(null);
+function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): ItemAlign[] {
+  const out: ItemAlign[] = items.map(() => ({ st: null, ops: null, startOp: null }));
   let oi = 0; // 下一个待消费算子的下标
   let rest = ''; // 已消费算子中尚未被 item 覆盖的剩余文本
   let restState: TextGraphicsState | null = null;
+  let restOp = -1; // rest 来源的算子下标
   let desynced = false;
   for (let i = 0; i < items.length; i++) {
     const want = normForMatch(items[i].str);
@@ -241,10 +251,13 @@ function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): (Tex
       oi = found;
       rest = '';
       restState = null;
+      restOp = -1;
       desynced = false;
     }
     let acc = rest;
     let firstState = rest ? restState : null;
+    const fromOp = rest ? restOp : -1; // item 首字符来自前序算子的剩余部分
+    const startOi = oi;
     while (acc.length < want.length && oi < ops.length) {
       if (!firstState) firstState = ops[oi].st;
       acc += normForMatch(ops[oi].s);
@@ -252,20 +265,33 @@ function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): (Tex
       oi++;
     }
     if (acc.startsWith(want) && firstState) {
-      out[i] = firstState;
+      const consumed: number[] = [];
+      if (fromOp >= 0) consumed.push(fromOp);
+      for (let j = startOi; j < oi; j++) consumed.push(j);
+      out[i] = {
+        st: firstState,
+        ops: consumed,
+        // 首字符来自新消费算子的起点 → 该算子原点即 item 原点（redact 几何校验用）。
+        // 例外：算子文本以前导空白开头时 pdf.js 会跳过空白、把 item 原点右移，
+        // 此时 item 原点 ≠ 算子原点，不能作校验基准（置 null）
+        startOp: fromOp < 0 && startOi < oi && !/^\s/.test(ops[startOi].s) ? startOi : null,
+      };
       rest = acc.slice(want.length);
+      restOp = oi - 1; // rest 来自最后一个被消费的算子
     } else {
       desynced = true;
       rest = '';
       restState = null;
+      restOp = -1;
     }
   }
   return out;
 }
 
 /**
- * 追踪内容流的文字相关图形状态，按 getTextContent 的 item 返回状态快照（对齐失败的 item 为 null）。
+ * 追踪内容流的文字相关图形状态，按 getTextContent 的 item 返回对齐结果（对齐失败的 item 各字段为 null）。
  * 与 getTextContent 的 str item 一一对应；整体异常时返回 null，全部回退像素采样/默认值。
+ * opCount 为本页文本显示算子总数（redact.ts 与原始内容流对齐校验用）。
  *
  * 注：pdf.js 5.x 在 worker 侧已把所有 sc/scn/g/rg/k 统一转成 setFillRGBColor/setStrokeRGBColor
  * （'#rrggbb' 字符串，含 ICC/CMYK/灰度的转换），主线程算子流里只剩 RGBColor、
@@ -274,7 +300,7 @@ function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): (Tex
 export async function extractTextGraphicsState(
   page: pdfjs.PDFPageProxy,
   items: { str: string }[],
-): Promise<(TextGraphicsState | null)[] | null> {
+): Promise<{ aligns: ItemAlign[]; opCount: number } | null> {
   try {
     const ol = await page.getOperatorList();
     const OPS = pdfjs.OPS;
@@ -346,7 +372,7 @@ export async function extractTextGraphicsState(
           break;
       }
     }
-    return alignStatesToItems(ops, items);
+    return { aligns: alignStatesToItems(ops, items), opCount: ops.length };
   } catch {
     return null;
   }
@@ -354,19 +380,38 @@ export async function extractTextGraphicsState(
 
 /* ---------------- 文字提取 ---------------- */
 
+export interface ExtractedSpans {
+  spans: SpanEdit[];
+  /** 本页文本显示算子总数；算子流解析失败时为 undefined（redact 整页降级） */
+  textOpCount?: number;
+  /** 起点可精确定位的算子原点（pt，左上角原点；key 为算子序号） */
+  opOrigins?: Record<number, { x: number; y: number }>;
+}
+
 /** 提取一页的真实文字层，坐标为 pt、左上角原点 */
 export async function extractSpans(
   doc: PdfDoc,
   pageIndex: number,
   rendered: HTMLCanvasElement,
   renderScale: number,
-): Promise<SpanEdit[]> {
+): Promise<ExtractedSpans> {
   const page = await doc.getPage(pageIndex + 1);
   const viewport = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
   // 含 str 的 item 与内容流中的文本显示算子一一对应，用序号对齐图形状态
   const strItems = tc.items.filter((it): it is Extract<(typeof tc.items)[number], { str: string }> => 'str' in it);
-  const fillStates = await extractTextGraphicsState(page, strItems);
+  const gsInfo = await extractTextGraphicsState(page, strItems);
+  const aligns = gsInfo?.aligns ?? null;
+  // 起点算子的原点（redact.ts 的几何校验基准）：item 变换的平移分量即算子原点
+  const opOrigins: Record<number, { x: number; y: number }> = {};
+  if (aligns) {
+    for (let i = 0; i < strItems.length; i++) {
+      const so = aligns[i].startOp;
+      if (so == null) continue;
+      const t0 = pdfjs.Util.transform(viewport.transform, strItems[i].transform);
+      opOrigins[so] = { x: t0[4], y: t0[5] };
+    }
+  }
   const spans: SpanEdit[] = [];
   let n = 0;
   for (let idx = 0; idx < strItems.length; idx++) {
@@ -418,7 +463,7 @@ export async function extractSpans(
     if (originalFontName) originalFontName = originalFontName.replace(/^[A-Z]{6}\+/, '') || undefined;
     const bgColor = sampleBackground(rendered, x, y, width, height, renderScale);
     // 优先用内容流算子里的精确图形状态；对齐失败/图案填充（空串）的 span 各自回退像素采样
-    const gs = fillStates?.[idx];
+    const gs = aligns?.[idx]?.st ?? null;
     if (gs?.fill === 'transparent') continue; // 透明填充：不可见文字，同 Tr=3 不建 span
     const color = gs?.fill ? gs.fill : sampleTextColor(rendered, x, y, width, height, renderScale, bgColor);
     // 描边色同样过滤哨兵值：'transparent' 和 ''（图案）都不作为纯色描边
@@ -454,9 +499,14 @@ export async function extractSpans(
       renderingMode: gs?.renderingMode ?? 0,
       strokeColor,
       strokeLineWidth: gs?.lineWidth,
+      textOps: aligns?.[idx]?.ops ?? undefined,
       deleted: false,
     });
   }
   // Tr=3 为不可见文字（OCR 层），不创建可编辑 span（透明填充的已在上面跳过）
-  return spans.filter((s) => s.renderingMode !== 3);
+  return {
+    spans: spans.filter((s) => s.renderingMode !== 3),
+    textOpCount: gsInfo?.opCount,
+    opOrigins: aligns ? opOrigins : undefined,
+  };
 }
