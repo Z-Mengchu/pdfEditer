@@ -74,6 +74,60 @@ export function boldVariantIdOf(id: string): string | undefined {
   return b && builtinById.has(b) ? b : undefined;
 }
 
+/* ---------------- PDF 内嵌字体（从原文提取的真实字体程序） ---------------- */
+
+interface EmbeddedFontEntry {
+  /** 展示名（剥掉子集前缀的 BaseFont） */
+  name: string;
+  bytes: Uint8Array;
+}
+
+/** 当前文档的内嵌字体，key 为 fontId（embedded:<pdf.js fontName>）；换文档时须清空 */
+const embeddedFonts = new Map<string, EmbeddedFontEntry>();
+
+export function isEmbeddedFontId(id: string): boolean {
+  return id.startsWith('embedded:');
+}
+
+/**
+ * 注册一个从 PDF 提取的内嵌字体程序（pdf.js 转译后的 OTF/TTF 字节）。
+ * fontkit 无法解析（或 TTC 合集）时不注册，返回 undefined，调用方按无内嵌字体处理。
+ */
+export function registerEmbeddedFont(
+  pdfFontName: string,
+  displayName: string,
+  bytes: Uint8Array,
+): string | undefined {
+  const id = `embedded:${pdfFontName}`;
+  if (embeddedFonts.has(id)) return id;
+  try {
+    const font = fontkit.create(bytes as unknown as Parameters<typeof fontkit.create>[0]) as fontkit.Font & {
+      fonts?: fontkit.Font[];
+    };
+    if (font.fonts) return undefined;
+  } catch {
+    return undefined;
+  }
+  embeddedFonts.set(id, { name: displayName, bytes });
+  return id;
+}
+
+/** 更换文档时清空内嵌字体注册表，并移除已注册的预览 FontFace、加载缓存 */
+export function clearEmbeddedFonts(): void {
+  if (embeddedFonts.size === 0) return;
+  for (const id of embeddedFonts.keys()) {
+    loadCache.delete(id);
+    const family = cssFamilyFor(id);
+    registeredFaces.delete(family);
+    if (typeof document !== 'undefined') {
+      for (const face of document.fonts) {
+        if (face.family === family) document.fonts.delete(face);
+      }
+    }
+  }
+  embeddedFonts.clear();
+}
+
 /* ---------------- 按原字体名匹配内置字体 ---------------- */
 
 /** 粗字重名判定（与 pdfjs.ts 提取时的 bold 检测保持一致） */
@@ -110,16 +164,21 @@ export function isBoldWeightFontId(id: string): boolean {
 }
 
 /**
- * 预览/导出共用的字体回退链：显式 fontId → 按原字体名匹配内置库 → 默认字体。
- * 自动匹配到的字体文件本身就是原字重（如 SemiBold/Bold），此时把 bold 置 false，
- * 避免在原字重上再叠加真加粗/伪加粗导致双重加粗。
+ * 预览/导出共用的字体回退链：显式 fontId → 原 PDF 内嵌字体 → 按原字体名匹配内置库 → 默认字体。
+ * 内嵌字体是原文使用的真实字体程序，字重已含在字形里：名字含 Bold 等粗字重时把 bold 置 false，
+ * 避免在原字重上再叠加真加粗/伪加粗导致双重加粗（内置库匹配同理）。
  */
 export function resolveFontChoice(
   fontId: string | undefined,
   originalFontName: string | undefined,
   bold: boolean,
+  embeddedFontId?: string,
 ): { fontId?: string; bold: boolean } {
   if (fontId) return { fontId, bold };
+  if (embeddedFontId) {
+    const embedded = embeddedFonts.get(embeddedFontId);
+    if (embedded) return { fontId: embeddedFontId, bold: bold && !BOLD_WEIGHT_RE.test(embedded.name) };
+  }
   const auto = matchBuiltinFontId(originalFontName);
   return { fontId: auto, bold: auto ? bold && !isBoldWeightFontId(auto) : bold };
 }
@@ -206,6 +265,11 @@ async function doLoad(id: string): Promise<LoadedFont> {
     if (isTtcHeader(head)) throw new Error(`「${d.fullName}」是 TTC 字体合集，暂不支持`);
     bytes = new Uint8Array(await blob.arrayBuffer());
     name = d.fullName;
+  } else if (isEmbeddedFontId(id)) {
+    const e = embeddedFonts.get(id);
+    if (!e) throw new Error('原 PDF 的内嵌字体已失效（文档已更换），请重新打开文件');
+    bytes = e.bytes;
+    name = e.name;
   } else {
     throw new Error(`未知字体：${id}`);
   }

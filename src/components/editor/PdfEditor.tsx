@@ -25,6 +25,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { loadPdf, renderPage, getPageViewport, extractSpans, type PdfDoc } from '@/lib/pdf/pdfjs';
+import { clearEmbeddedFonts } from '@/lib/pdf/fonts';
 import { exportEditedPdf } from '@/lib/pdf/exportPdf';
 import { extractRawGraphics, clusterElements, type VectorElement } from '@/lib/pdf/elements';
 import type { EditItem, ElementEdit, PageState, RegionEdit, Selection, SpanEdit, Tool } from '@/lib/pdf/types';
@@ -87,6 +88,7 @@ export default function PdfEditor({ fileName, bytes, onReset }: Props) {
     let cancelled = false;
     (async () => {
       try {
+        clearEmbeddedFonts(); // 新文档：清掉上一份 PDF 提取的内嵌字体
         const d = await loadPdf(bytes.slice(0));
         if (cancelled) return;
         setDoc(d);

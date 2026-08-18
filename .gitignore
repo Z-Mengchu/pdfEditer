@@ -41,3 +41,4 @@ Desktop.ini
 # Local-only files
 *.local
 /ai/
+test/.build/

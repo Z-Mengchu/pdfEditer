@@ -35,6 +35,8 @@ export interface SpanEdit {
   fontId?: string;
   /** 解析 PDF 时识别出的原字体名（仅展示用） */
   originalFontName?: string;
+  /** 从原文提取的内嵌字体 fontId（embedded:…）；未显式选字体时优先于内置库匹配 */
+  embeddedFontId?: string;
   /** 原文字距 Tc（pt，默认 0）；非用户可编辑，不参与 spanDirty */
   charSpacing?: number;
   /** 原词距 Tw（pt，默认 0，仅对空格生效） */

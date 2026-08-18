@@ -357,7 +357,7 @@ async function applyEdits(
   for (const p of pages) {
     for (const s of p.spans) {
       if (!spanDirty(s) || s.deleted || !s.text.trim()) continue;
-      const fid = resolveFontChoice(s.fontId, s.originalFontName, s.bold).fontId;
+      const fid = resolveFontChoice(s.fontId, s.originalFontName, s.bold, s.embeddedFontId).fontId;
       if (fid) usedFontIds.add(fid);
     }
     for (const r of p.regions) {
@@ -405,7 +405,7 @@ async function applyEdits(
     for (const r of p.regions) drawRegionFill(page, pageH, r);
     for (const s of p.spans) {
       if (spanDirty(s) && !s.deleted && s.text.trim()) {
-        const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold);
+        const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold, s.embeddedFontId);
         drawSpanText(page, pageH, { ...s, bold: rf.bold }, fonts, customFor(rf.fontId));
       }
     }

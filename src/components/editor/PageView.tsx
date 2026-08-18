@@ -57,11 +57,15 @@ function previewUrl(elId: string, bytes: ArrayBuffer): string {
 function usePreviewFontFamilies(items: (SpanEdit | RegionEdit)[]): Record<string, string> {
   const [families, setFamilies] = useState<Record<string, string>>({});
   const [, setCjkReady] = useState(false);
-  // 未显式选字体的 span 也按原字体名匹配内置库加载预览字体，与导出回退链一致
+  // 未显式选字体的 span 也走与导出一致的回退链（内嵌字体 → 原字体名匹配内置库）加载预览字体
   const idsKey = [
     ...new Set(
       items
-        .map((i) => resolveFontChoice(i.fontId, isSpan(i) ? i.originalFontName : undefined, false).fontId)
+        .map(
+          (i) =>
+            resolveFontChoice(i.fontId, isSpan(i) ? i.originalFontName : undefined, false, isSpan(i) ? i.embeddedFontId : undefined)
+              .fontId,
+        )
         .filter((x): x is string => !!x),
     ),
   ]
@@ -418,10 +422,10 @@ export default function PageView({
   /* ---------- 内联文本编辑（受控输入，边打字边提交，避免失焦时序问题） ---------- */
   const renderEditor = (item: SpanEdit | RegionEdit) => {
     const isRegion = item.kind === 'region';
-    // span 走与导出一致的字体回退链（原字体名匹配内置库 + 字重修正）
+    // span 走与导出一致的字体回退链（内嵌字体 → 原字体名匹配内置库 + 字重修正）
     const rf = isRegion
       ? { fontId: item.fontId, bold: item.bold }
-      : resolveFontChoice(item.fontId, item.originalFontName, item.bold);
+      : resolveFontChoice(item.fontId, item.originalFontName, item.bold, item.embeddedFontId);
     const commit = (v: string) => {
       if (item.kind === 'span') onUpdateSpan(item.id, { text: v });
       else onUpdateRegion(item.id, { text: v });
@@ -459,7 +463,7 @@ export default function PageView({
     if (editingId === s.id) return renderEditor(s);
     const dirty = spanDirty(s);
     const selected = selection?.kind === 'span' && selection.id === s.id;
-    const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold);
+    const rf = resolveFontChoice(s.fontId, s.originalFontName, s.bold, s.embeddedFontId);
     return (
       <div
         key={s.id}

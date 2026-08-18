@@ -1,13 +1,19 @@
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import type { SpanEdit } from './types';
+import { registerEmbeddedFont } from './fonts';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
 export type PdfDoc = pdfjs.PDFDocumentProxy;
 
 export async function loadPdf(data: ArrayBuffer): Promise<PdfDoc> {
-  const doc = await pdfjs.getDocument({ data }).promise;
+  const doc = await pdfjs.getDocument({
+    data,
+    // 保留内嵌字体程序字节：pdf.js 默认在字体绑定完成后清空 font.data，
+    // 该选项使其保留，extractSpans 才能提取原字体供预览/导出嵌入
+    fontExtraProperties: true,
+  }).promise;
   return doc;
 }
 
@@ -155,6 +161,9 @@ function cmykToHex(c: number, m: number, y: number, k: number): string {
 /**
  * 每个文本显示算子处的图形状态快照（Tc/Tw/Tz/Tr/填充色/描边色/线宽）。
  * hScale 为百分比（100 = 无缩放），spacing 单位为 pt。
+ * fill/stroke 的两个哨兵值：
+ * - 'transparent'：该绘制不可见（对应 pdf.js 的 setFillTransparent/setStrokeTransparent）；
+ * - ''：图案（Pattern）填充/描边，无法表示为纯色，调用方应回退像素采样。
  */
 export interface TextGraphicsState {
   fill: string;
@@ -176,19 +185,100 @@ const DEFAULT_TEXT_STATE: TextGraphicsState = {
   lineWidth: 1,
 };
 
+/** 一个文本显示算子的记录：状态快照 + 该算子解码出的文本（glyph unicode 拼接） */
+interface TextOpRecord {
+  st: TextGraphicsState;
+  s: string;
+}
+
+/** showText 系列算子的 args[0] 是 glyph 数组（数字为 TJ 间距），拼出其 unicode 文本 */
+function decodeShownText(args: unknown[]): string {
+  const glyphs = args?.[0];
+  if (typeof glyphs === 'string') return glyphs;
+  if (!Array.isArray(glyphs)) return '';
+  let s = '';
+  for (const g of glyphs) {
+    if (g && typeof g === 'object' && typeof (g as { unicode?: unknown }).unicode === 'string') {
+      s += (g as { unicode: string }).unicode;
+    }
+  }
+  return s;
+}
+
+/** 对齐匹配用的归一化：NFKC（连字 ﬁ→fi、全角→半角等，与 pdf.js normalizeUnicode 同向）+ 去空白
+ *  （getTextContent 会插入假空格，算子解码文本没有，比较前都去掉） */
+function normForMatch(s: string): string {
+  return s.normalize('NFKC').replace(/\s+/g, '');
+}
+
 /**
- * 追踪内容流的文字相关图形状态，返回每个文本显示算子（Tj/TJ/'/"）处的状态快照。
- * 与 getTextContent 的 item 同源同序，可一一对应；
- * 数量对不上等异常情况返回 null，整体回退到像素采样/默认值。
+ * 把每个文本显示算子的状态对齐到 getTextContent 的 item。
+ * 两边不是一一对应：getTextContent 会把多个连续 Tj 合并成一个 item，
+ * 也会因大字距/EOL 把一个 TJ 拆成多个 item，纯空白 item 更是 pdf.js 插入的假空格。
+ * 因此按解码文本做流式匹配：逐个 item 消费算子文本，前缀吻合即对齐成功，
+ * 取贡献该 item 第一个字符的算子状态；对不上的 item 置 null（调用方按 span 回退像素采样），
+ * 失步后在后续算子中扫描重同步，彻底失败则剩余 item 全部为 null。
  */
-async function extractTextGraphicsState(
+function alignStatesToItems(ops: TextOpRecord[], items: { str: string }[]): (TextGraphicsState | null)[] {
+  const out: (TextGraphicsState | null)[] = new Array(items.length).fill(null);
+  let oi = 0; // 下一个待消费算子的下标
+  let rest = ''; // 已消费算子中尚未被 item 覆盖的剩余文本
+  let restState: TextGraphicsState | null = null;
+  let desynced = false;
+  for (let i = 0; i < items.length; i++) {
+    const want = normForMatch(items[i].str);
+    if (!want) continue; // 假空格 item，不消费算子
+    if (desynced) {
+      let found = -1;
+      for (let j = oi; j < Math.min(ops.length, oi + 500); j++) {
+        const opN = normForMatch(ops[j].s);
+        if (opN && (opN.startsWith(want) || want.startsWith(opN))) {
+          found = j;
+          break;
+        }
+      }
+      if (found === -1) break; // 无法重同步，剩余 item 保持 null
+      oi = found;
+      rest = '';
+      restState = null;
+      desynced = false;
+    }
+    let acc = rest;
+    let firstState = rest ? restState : null;
+    while (acc.length < want.length && oi < ops.length) {
+      if (!firstState) firstState = ops[oi].st;
+      acc += normForMatch(ops[oi].s);
+      restState = ops[oi].st;
+      oi++;
+    }
+    if (acc.startsWith(want) && firstState) {
+      out[i] = firstState;
+      rest = acc.slice(want.length);
+    } else {
+      desynced = true;
+      rest = '';
+      restState = null;
+    }
+  }
+  return out;
+}
+
+/**
+ * 追踪内容流的文字相关图形状态，按 getTextContent 的 item 返回状态快照（对齐失败的 item 为 null）。
+ * 与 getTextContent 的 str item 一一对应；整体异常时返回 null，全部回退像素采样/默认值。
+ *
+ * 注：pdf.js 5.x 在 worker 侧已把所有 sc/scn/g/rg/k 统一转成 setFillRGBColor/setStrokeRGBColor
+ * （'#rrggbb' 字符串，含 ICC/CMYK/灰度的转换），主线程算子流里只剩 RGBColor、
+ * ColorN（图案）和 Transparent 三类，Gray/CMYKColor 分支保留仅作防御。
+ */
+export async function extractTextGraphicsState(
   page: pdfjs.PDFPageProxy,
-  itemCount: number,
-): Promise<TextGraphicsState[] | null> {
+  items: { str: string }[],
+): Promise<(TextGraphicsState | null)[] | null> {
   try {
     const ol = await page.getOperatorList();
     const OPS = pdfjs.OPS;
-    const states: TextGraphicsState[] = [];
+    const ops: TextOpRecord[] = [];
     let cur: TextGraphicsState = { ...DEFAULT_TEXT_STATE };
     const stack: TextGraphicsState[] = [];
     for (let i = 0; i < ol.fnArray.length; i++) {
@@ -210,6 +300,12 @@ async function extractTextGraphicsState(
         case OPS.setFillCMYKColor:
           cur.fill = cmykToHex(args[0], args[1], args[2], args[3]);
           break;
+        case OPS.setFillColorN:
+          cur.fill = ''; // 图案填充，无纯色表示
+          break;
+        case OPS.setFillTransparent:
+          cur.fill = 'transparent';
+          break;
         case OPS.setStrokeRGBColor:
           cur.stroke = args[0];
           break;
@@ -218,6 +314,12 @@ async function extractTextGraphicsState(
           break;
         case OPS.setStrokeCMYKColor:
           cur.stroke = cmykToHex(args[0], args[1], args[2], args[3]);
+          break;
+        case OPS.setStrokeColorN:
+          cur.stroke = '';
+          break;
+        case OPS.setStrokeTransparent:
+          cur.stroke = 'transparent';
           break;
         case OPS.setCharSpacing:
           cur.charSpacing = args[0];
@@ -238,13 +340,13 @@ async function extractTextGraphicsState(
         case OPS.showSpacedText:
         case OPS.nextLineShowText:
         case OPS.nextLineSetSpacingShowText:
-          states.push({ ...cur });
+          ops.push({ st: { ...cur }, s: decodeShownText(args) });
           break;
         default:
           break;
       }
     }
-    return states.length === itemCount ? states : null;
+    return alignStatesToItems(ops, items);
   } catch {
     return null;
   }
@@ -264,7 +366,7 @@ export async function extractSpans(
   const tc = await page.getTextContent();
   // 含 str 的 item 与内容流中的文本显示算子一一对应，用序号对齐图形状态
   const strItems = tc.items.filter((it): it is Extract<(typeof tc.items)[number], { str: string }> => 'str' in it);
-  const fillStates = await extractTextGraphicsState(page, strItems.length);
+  const fillStates = await extractTextGraphicsState(page, strItems);
   const spans: SpanEdit[] = [];
   let n = 0;
   for (let idx = 0; idx < strItems.length; idx++) {
@@ -292,17 +394,35 @@ export async function extractSpans(
     const bold = /bold|black|heavy|demi|medium/.test(fontName);
     // 原字体名：优先取字体对象的 BaseFont（剥掉子集前缀 ABCDEF+），退化为 styles.fontFamily
     let originalFontName: string | undefined;
+    let embeddedFontId: string | undefined;
     try {
-      const fontObj = page.commonObjs.get(item.fontName) as { name?: string } | null;
+      const fontObj = page.commonObjs.get(item.fontName) as {
+        name?: string;
+        data?: Uint8Array | null;
+        isType3Font?: boolean;
+        missingFile?: boolean;
+        disableFontFace?: boolean;
+      } | null;
       originalFontName = fontObj?.name ?? style?.fontFamily;
+      // 提取真实内嵌字体程序（pdf.js 已转译为 OTF/TTF）；Type3/缺文件/系统替代字体无可用程序
+      if (fontObj?.data && !fontObj.isType3Font && !fontObj.missingFile && !fontObj.disableFontFace) {
+        embeddedFontId = registerEmbeddedFont(
+          item.fontName,
+          (fontObj.name ?? item.fontName).replace(/^[A-Z]{6}\+/, ''),
+          fontObj.data,
+        );
+      }
     } catch {
       originalFontName = style?.fontFamily;
     }
     if (originalFontName) originalFontName = originalFontName.replace(/^[A-Z]{6}\+/, '') || undefined;
     const bgColor = sampleBackground(rendered, x, y, width, height, renderScale);
-    // 优先用内容流算子里的精确图形状态，提取失败（数量对不上等）整体回退像素采样/默认值
+    // 优先用内容流算子里的精确图形状态；对齐失败/图案填充（空串）的 span 各自回退像素采样
     const gs = fillStates?.[idx];
-    const color = gs?.fill ?? sampleTextColor(rendered, x, y, width, height, renderScale, bgColor);
+    if (gs?.fill === 'transparent') continue; // 透明填充：不可见文字，同 Tr=3 不建 span
+    const color = gs?.fill ? gs.fill : sampleTextColor(rendered, x, y, width, height, renderScale, bgColor);
+    // 描边色同样过滤哨兵值：'transparent' 和 ''（图案）都不作为纯色描边
+    const strokeColor = gs?.stroke && gs.stroke !== 'transparent' ? gs.stroke : undefined;
     spans.push({
       kind: 'span',
       id: `s${pageIndex}-${n++}`,
@@ -327,15 +447,16 @@ export async function extractSpans(
       bold,
       originalBold: bold,
       originalFontName,
+      embeddedFontId,
       charSpacing: gs?.charSpacing ?? 0,
       wordSpacing: gs?.wordSpacing ?? 0,
       hScale: gs?.hScale ?? 100,
       renderingMode: gs?.renderingMode ?? 0,
-      strokeColor: gs?.stroke,
+      strokeColor,
       strokeLineWidth: gs?.lineWidth,
       deleted: false,
     });
   }
-  // Tr=3 为不可见文字（OCR 层），不创建可编辑 span；在 zip 对齐完成后过滤
+  // Tr=3 为不可见文字（OCR 层），不创建可编辑 span（透明填充的已在上面跳过）
   return spans.filter((s) => s.renderingMode !== 3);
 }
